@@ -109,15 +109,6 @@ with tab_template:
             a_doc = ezdxf.readfile(str(template_path))
             layouts = core.list_layout_names(a_doc)
             st.write(f"目前基準圖框包含的圖紙 (Layout)：**{', '.join(layouts)}**")
-            cols = st.columns(min(3, len(layouts)) or 1)
-            for i, lname in enumerate(layouts):
-                with cols[i % len(cols)]:
-                    st.write(f"**{lname}**")
-                    try:
-                        png = render_preview_png(a_doc, lname)
-                        st.image(png, use_container_width=True)
-                    except Exception as e:
-                        st.write(f"(預覽失敗: {e})")
         except Exception as e:
             st.error(f"目前的基準圖框讀取失敗：{e}")
     else:
@@ -147,16 +138,26 @@ with tab_merge:
         a_doc_preview = ezdxf.readfile(str(template_path))
         layout_names = core.list_layout_names(a_doc_preview)
 
+        AUTO_LAYOUT_OPTION = "自動（依 B 模型尺寸選擇，建議）"
+        AUTO_SEMI_OPTION = "自動判斷（依 B 圖是否含 BOM 表，建議）"
+        SEMI_YES_OPTION = "手動：這是半成品 / 組裝件"
+        SEMI_NO_OPTION = "手動：這不是半成品"
+
         st.subheader("設定")
         c1, c2, c3 = st.columns(3)
         with c1:
-            target_layout = st.selectbox("要套用的圖紙尺寸 (A 的 Layout)", layout_names)
+            target_layout_choice = st.selectbox(
+                "要套用的圖紙尺寸 (A 的 Layout)", [AUTO_LAYOUT_OPTION] + layout_names
+            )
         with c2:
             mode = st.selectbox(
                 "結合模式", list(MODE_LABELS.keys()), format_func=lambda k: MODE_LABELS[k]
             )
         with c3:
-            semi_finished = st.checkbox("這是半成品 / 組裝件（比例填 n/a，不需計算整數比例）")
+            semi_finished_choice = st.selectbox(
+                "半成品 / 組裝件判定（比例填 n/a，不需計算整數比例）",
+                [AUTO_SEMI_OPTION, SEMI_YES_OPTION, SEMI_NO_OPTION],
+            )
 
         with st.expander("額外要補充的 Notes 項目（選填 - B 舊圖自己的備註會自動比對合併，不需要在這裡重複輸入）"):
             notes_text = st.text_area(
@@ -171,49 +172,79 @@ with tab_merge:
         b_files = st.file_uploader("上傳 B 圖面 (.dxf)，可複選", type=["dxf"], accept_multiple_files=True)
 
         output_formats = st.multiselect(
-            "輸出格式", ["DXF (AutoCAD 2000)", "PNG 預覽圖"], default=["DXF (AutoCAD 2000)", "PNG 預覽圖"]
+            "輸出格式", ["DXF (AutoCAD 2000)", "PNG 預覽圖"], default=["DXF (AutoCAD 2000)"]
         )
 
         if b_files and st.button("開始合併", type="primary"):
             extra_lines = [l.strip() for l in notes_text.splitlines() if l.strip()] or None
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                for bf in b_files:
-                    st.write(f"### {bf.name}")
-                    try:
-                        a_doc = ezdxf.readfile(str(template_path))
-                        b_doc = read_dxf_bytes(bf.getvalue())
-                        # AutoCAD 2000 == DXF version AC1015, output always
-                        # normalised to this per the "統一轉AutoCAD 2000" rule.
-                        out_doc, report = merge.run_merge(
-                            a_doc, b_doc, target_layout, mode,
-                            semi_finished=semi_finished, extra_note_lines=extra_lines,
+            # Collect every output file across every B drawing here first,
+            # and only decide zip-or-not once we know the final count -
+            # "單一檔案輸出時直接給檔案本身，不包成 zip；只有選了多個
+            # 檔案才打包 zip" (this refers to the number of B drawings
+            # processed, not to how many output *formats* were picked for
+            # a single one - one B file with both DXF+PNG selected is
+            # still packaged, since that's genuinely more than one file).
+            outputs = []  # list of (filename, bytes, mime)
+            for bf in b_files:
+                st.write(f"### {bf.name}")
+                try:
+                    a_doc = ezdxf.readfile(str(template_path))
+                    b_doc = read_dxf_bytes(bf.getvalue())
+
+                    if target_layout_choice == AUTO_LAYOUT_OPTION:
+                        target_layout, layout_note = core.suggest_target_layout(a_doc, b_doc)
+                        st.write(f"- 圖紙尺寸：{layout_note}")
+                    else:
+                        target_layout = target_layout_choice
+
+                    if semi_finished_choice == AUTO_SEMI_OPTION:
+                        semi_finished = core.b_has_bom_objects(b_doc)
+                        st.write(
+                            f"- 半成品判定：偵測到 B 圖{'含有' if semi_finished else '沒有'}"
+                            f"BOM 表，自動判定為{'半成品/組裝件' if semi_finished else '一般零件圖'}。"
                         )
-                        out_doc.dxfversion = "AC1015"
+                    else:
+                        semi_finished = semi_finished_choice == SEMI_YES_OPTION
 
-                        st.write(f"- 比例欄位：**{report.scale.ratio_text}**")
-                        if report.unmatched_attdefs:
-                            st.write(f"- 找不到對應舊值、沿用 A 預設的欄位：{report.unmatched_attdefs}")
-                        if report.relocated_entities:
-                            st.write(f"- 有 {report.relocated_entities} 個物件因為壓到標題欄，已移到圖框下方，請手動拖回。")
-                        for w in report.warnings:
-                            st.write(f"- ⚠️ {w}")
+                    # AutoCAD 2000 == DXF version AC1015, output always
+                    # normalised to this per the "統一轉AutoCAD 2000" rule.
+                    out_doc, report = merge.run_merge(
+                        a_doc, b_doc, target_layout, mode,
+                        semi_finished=semi_finished, extra_note_lines=extra_lines,
+                    )
+                    out_doc.dxfversion = "AC1015"
 
-                        stem = Path(bf.name).stem
-                        if "DXF (AutoCAD 2000)" in output_formats:
-                            zf.writestr(f"{stem}_merged.dxf", write_dxf_bytes(out_doc))
-                        if "PNG 預覽圖" in output_formats:
-                            png = render_preview_png(out_doc, target_layout)
-                            zf.writestr(f"{stem}_merged_preview.png", png)
-                            st.image(png, caption=f"{stem} 合併結果預覽", use_container_width=True)
-                    except Exception as e:
-                        st.error(f"{bf.name} 合併失敗：{e}")
+                    st.write(f"- 比例欄位：**{report.scale.ratio_text}**")
+                    if report.unmatched_attdefs:
+                        st.write(f"- 找不到對應舊值、沿用 A 預設的欄位：{report.unmatched_attdefs}")
+                    if report.relocated_entities:
+                        st.write(f"- 有 {report.relocated_entities} 個物件因為壓到標題欄，已移到圖框下方，請手動拖回。")
+                    for w in report.warnings:
+                        st.write(f"- ⚠️ {w}")
 
-            zip_buffer.seek(0)
-            st.download_button(
-                "下載全部結果 (ZIP)", data=zip_buffer, file_name="merged_drawings.zip",
-                mime="application/zip",
-            )
+                    stem = Path(bf.name).stem
+                    if "DXF (AutoCAD 2000)" in output_formats:
+                        outputs.append((f"{stem}_merged.dxf", write_dxf_bytes(out_doc), "application/dxf"))
+                    if "PNG 預覽圖" in output_formats:
+                        png = render_preview_png(out_doc, target_layout)
+                        outputs.append((f"{stem}_merged_preview.png", png, "image/png"))
+                        st.image(png, caption=f"{stem} 合併結果預覽", use_container_width=True)
+                except Exception as e:
+                    st.error(f"{bf.name} 合併失敗：{e}")
+
+            if len(outputs) == 1:
+                fname, data, mime = outputs[0]
+                st.download_button(f"下載 {fname}", data=data, file_name=fname, mime=mime)
+            elif len(outputs) > 1:
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for fname, data, _mime in outputs:
+                        zf.writestr(fname, data)
+                zip_buffer.seek(0)
+                st.download_button(
+                    "下載全部結果 (ZIP)", data=zip_buffer, file_name="merged_drawings.zip",
+                    mime="application/zip",
+                )
 
 # =======================================================================
 # TAB 3 — About / limitations

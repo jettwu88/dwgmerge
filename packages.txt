@@ -1,0 +1,2 @@
+fonts-dejavu-core
+fonts-noto-cjk
