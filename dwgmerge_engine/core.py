@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import re
 from typing import Optional
 
 import ezdxf
@@ -346,6 +347,162 @@ def suggest_target_layout(a_doc, b_doc) -> tuple[str, str]:
             f"自動選擇最大的圖紙「{largest_name}」（仍會依比例縮小到能放入圖框）。"
         )
     return largest_name, f"模型尺寸約 {mw:.0f}x{mh:.0f}mm，自動選擇「{largest_name}」。"
+
+
+# ---------------------------------------------------------------------
+# Output filename: 料號 + 版次 (auto-incremented) + 日期流水號, e.g.
+# "871203-0000 V1.1_091701" for a merge of "871203-0000_V1.0.dxf" done
+# on 09/17, first file in that batch.
+# ---------------------------------------------------------------------
+
+_VERSION_RE = re.compile(r"^[Vv]\s*(\d+)(?:\.(\d+))?$")
+_FILENAME_PART_VERSION_RE = re.compile(
+    r"^(?P<part>.+?)[\s_]+[Vv](?P<major>\d+)(?:\.(?P<minor>\d+))?\s*$"
+)
+
+
+def parse_version_string(text: Optional[str]) -> Optional[tuple[int, int]]:
+    """"V1.0" / "v2" / "V3.14" -> (major, minor). None if `text` doesn't
+    look like a version marker at all (empty, or some other value the
+    title block's 版次 field happens to hold)."""
+    if not text:
+        return None
+    m = _VERSION_RE.match(text.strip())
+    if not m:
+        return None
+    major = int(m.group(1))
+    minor = int(m.group(2)) if m.group(2) else 0
+    return major, minor
+
+
+def format_version(version: tuple[int, int]) -> str:
+    major, minor = version
+    return f"V{major}.{minor}"
+
+
+def next_version(version: tuple[int, int]) -> tuple[int, int]:
+    major, minor = version
+    return major, minor + 1
+
+
+def parse_filename_part_and_version(stem: str) -> tuple[str, Optional[tuple[int, int]]]:
+    """From a B filename's stem (no extension), split off a trailing
+    "_V<major>.<minor>"-style version marker if there is one. Returns
+    (part_no, version) - version is None (and the whole stem is
+    returned as the part number) if no such marker is found."""
+    m = _FILENAME_PART_VERSION_RE.match(stem)
+    if not m:
+        return stem, None
+    major = int(m.group("major"))
+    minor = int(m.group("minor")) if m.group("minor") else 0
+    return m.group("part"), (major, minor)
+
+
+def resolve_part_and_version(filename_stem: str, b_tb_attribs: dict) -> tuple[str, tuple[int, int], list[str]]:
+    """Combine B's own filename with B's own title block fields (料號 =
+    the 圖號 attrib, 版本 = the 版次 attrib) into one (part_no, version,
+    notes) triple for naming the merged output.
+
+    Rule (as specified): if the filename's version and the title
+    block's version disagree, the title block (drawing content) wins;
+    if only one side has a version at all, use whichever one does.
+    Part number always prefers the title block's own 圖號 field (that's
+    the authoritative value already carried into the merged drawing),
+    falling back to whatever the filename parses out.
+    """
+    notes = []
+    fn_part, fn_version = parse_filename_part_and_version(filename_stem)
+    content_part = (b_tb_attribs.get("圖號") or "").strip() or None
+    content_version = parse_version_string(b_tb_attribs.get("版次"))
+
+    part_no = content_part or fn_part or filename_stem
+
+    if content_version and fn_version and content_version != fn_version:
+        notes.append(
+            f"檔名的版本（{format_version(fn_version)}）跟圖檔標題欄的版次"
+            f"（{format_version(content_version)}）不一致，命名以圖檔內容為準。"
+        )
+        version = content_version
+    else:
+        version = content_version or fn_version
+
+    if version is None:
+        notes.append("找不到版本資訊（檔名跟標題欄的版次欄位都沒有），輸出檔名已預設為 V1.0。")
+        version = (1, 0)
+
+    return part_no, version, notes
+
+
+def b_titleblock_attribs(b_doc) -> dict:
+    """B's own title block ATTRIB values as a {tag: text} dict (last
+    value wins if a tag repeats, e.g. multiple 簽名日期 rows) - used to
+    read 圖號/版次 for output-filename purposes without needing the full
+    merge to have run yet."""
+    names = list_layout_names(b_doc)
+    if not names:
+        return {}
+    lay = b_doc.layout(names[0])
+    tb = find_titleblock_insert(lay)
+    if tb is None:
+        return {}
+    result = {}
+    for a in tb.attribs:
+        result[a.dxf.tag] = a.dxf.text
+    return result
+
+
+def build_output_stem(part_no: str, version: tuple[int, int], date_mmdd: str) -> str:
+    """"871203-0000 V1.1_0917" - 料號 + 版次_日期。"""
+    return f"{part_no} {format_version(version)}_{date_mmdd}"
+
+
+# ---------------------------------------------------------------------
+# Usage stats: turn the raw "timestamp,event,filename" CSV log (see
+# github_store.append_usage_event / download_usage_log) into the
+# numbers the "使用統計" tab shows - total downloads, this month, this
+# year, and a per-month breakdown for a simple trend view.
+# ---------------------------------------------------------------------
+
+def compute_usage_stats(csv_bytes: Optional[bytes], now=None) -> dict:
+    import csv
+    import io as _io
+    from datetime import datetime as _dt
+
+    now = now or _dt.now()
+    result = {"total": 0, "this_month": 0, "this_year": 0, "by_month": {}}
+    if not csv_bytes:
+        return result
+
+    text = csv_bytes.decode("utf-8", errors="replace")
+    reader = csv.reader(_io.StringIO(text))
+    rows = list(reader)
+    if rows and rows[0] and rows[0][0] == "timestamp":
+        rows = rows[1:]
+
+    by_month: dict[str, int] = {}
+    total = 0
+    this_month = 0
+    this_year = 0
+    for row in rows:
+        if not row or not row[0]:
+            continue
+        try:
+            dt = _dt.fromisoformat(row[0])
+        except ValueError:
+            continue
+        total += 1
+        key = dt.strftime("%Y-%m")
+        by_month[key] = by_month.get(key, 0) + 1
+        if dt.year == now.year:
+            this_year += 1
+            if dt.month == now.month:
+                this_month += 1
+
+    result["total"] = total
+    result["this_month"] = this_month
+    result["this_year"] = this_year
+    result["by_month"] = dict(sorted(by_month.items()))
+    return result
 
 
 def b_has_bom_objects(b_doc) -> bool:

@@ -8,7 +8,7 @@ and does not do, and for deployment instructions.
 import io
 import json
 import tempfile
-import zipfile
+from datetime import datetime
 from pathlib import Path
 
 import ezdxf
@@ -31,6 +31,22 @@ MODE_LABELS = {
     merge.MODE_B_STYLE_A_FRAME_ONLY: "模式 2：僅換 A 圖框，格式以 B 為主",
     merge.MODE_SIMPLE_COMBINE: "模式 3：單純結合，各自保留原格式",
 }
+
+
+# ---------------------------------------------------------------------
+# Usage log: one row per file actually downloaded, so the「使用統計」分頁
+# can show how many times this tool is actually being used - synced to
+# GitHub when configured (shared/persistent across everyone), otherwise
+# falls back to an in-session-only counter (see github_store.py).
+# ---------------------------------------------------------------------
+
+def log_download(filename: str):
+    st.session_state["session_download_count"] = st.session_state.get("session_download_count", 0) + 1
+    if github_store.is_usage_log_configured():
+        try:
+            github_store.append_usage_event(datetime.now().isoformat(timespec="seconds"), "download", filename)
+        except Exception as e:
+            st.warning(f"使用次數記錄失敗（不影響檔案下載）：{e}")
 
 
 # ---------------------------------------------------------------------
@@ -95,7 +111,9 @@ def render_preview_png(doc, layout_name: str) -> bytes:
 st.title("Wellell 圖框合併工具")
 st.caption("把舊圖 (B) 合併進公司標準圖框 (A) — DXF only，AutoCAD 2000 (.dxf) 格式輸出")
 
-tab_template, tab_merge, tab_about = st.tabs(["① 基準圖框 (A)", "② 批次合併 (B)", "說明 / 限制"])
+tab_template, tab_merge, tab_stats, tab_about = st.tabs(
+    ["① 基準圖框 (A)", "② 批次合併 (B)", "使用統計", "說明 / 限制"]
+)
 
 # =======================================================================
 # TAB 1 — Template (A) management
@@ -175,34 +193,39 @@ with tab_merge:
             "輸出格式", ["DXF (AutoCAD 2000)", "PNG 預覽圖"], default=["DXF (AutoCAD 2000)"]
         )
 
+        # Results (log lines + the actual output files) are stashed in
+        # session_state and re-rendered on EVERY run, not just the run
+        # where "開始合併" was clicked - clicking a st.download_button
+        # triggers its own rerun, on which "開始合併" reports unclicked
+        # again; if the download buttons (and the data behind them)
+        # only existed inside that first `if ... st.button(...)` block,
+        # they'd vanish on the very next rerun and the click could never
+        # be detected at all. Keeping them in session_state is what
+        # makes "log every download" (see log_download()) actually work.
         if b_files and st.button("開始合併", type="primary"):
             extra_lines = [l.strip() for l in notes_text.splitlines() if l.strip()] or None
-            # Collect every output file across every B drawing here first,
-            # and only decide zip-or-not once we know the final count -
-            # "單一檔案輸出時直接給檔案本身，不包成 zip；只有選了多個
-            # 檔案才打包 zip" (this refers to the number of B drawings
-            # processed, not to how many output *formats* were picked for
-            # a single one - one B file with both DXF+PNG selected is
-            # still packaged, since that's genuinely more than one file).
-            outputs = []  # list of (filename, bytes, mime)
+            today_mmdd = datetime.now().strftime("%m%d")
+            log_entries = []   # list of ("write"|"error", text)
+            outputs = []       # list of (filename, bytes, mime)
+            images = []        # list of (filename, png_bytes, caption)
             for bf in b_files:
-                st.write(f"### {bf.name}")
+                log_entries.append(("write", f"### {bf.name}"))
                 try:
                     a_doc = ezdxf.readfile(str(template_path))
                     b_doc = read_dxf_bytes(bf.getvalue())
 
                     if target_layout_choice == AUTO_LAYOUT_OPTION:
                         target_layout, layout_note = core.suggest_target_layout(a_doc, b_doc)
-                        st.write(f"- 圖紙尺寸：{layout_note}")
+                        log_entries.append(("write", f"- 圖紙尺寸：{layout_note}"))
                     else:
                         target_layout = target_layout_choice
 
                     if semi_finished_choice == AUTO_SEMI_OPTION:
                         semi_finished = core.b_has_bom_objects(b_doc)
-                        st.write(
+                        log_entries.append(("write", (
                             f"- 半成品判定：偵測到 B 圖{'含有' if semi_finished else '沒有'}"
                             f"BOM 表，自動判定為{'半成品/組裝件' if semi_finished else '一般零件圖'}。"
-                        )
+                        )))
                     else:
                         semi_finished = semi_finished_choice == SEMI_YES_OPTION
 
@@ -214,40 +237,84 @@ with tab_merge:
                     )
                     out_doc.dxfversion = "AC1015"
 
-                    st.write(f"- 比例欄位：**{report.scale.ratio_text}**")
-                    if report.unmatched_attdefs:
-                        st.write(f"- 找不到對應舊值、沿用 A 預設的欄位：{report.unmatched_attdefs}")
-                    if report.relocated_entities:
-                        st.write(f"- 有 {report.relocated_entities} 個物件因為壓到標題欄，已移到圖框下方，請手動拖回。")
-                    for w in report.warnings:
-                        st.write(f"- ⚠️ {w}")
+                    # 輸出檔名：料號 版次(自動+1)_日期，例如
+                    # "871203-0000 V1.1_0917" - 料號/版次來自 B 的檔名
+                    # 跟標題欄版次 (版次衝突時以標題欄內容為準)。
+                    b_attribs = core.b_titleblock_attribs(b_doc)
+                    part_no, old_version, name_notes = core.resolve_part_and_version(
+                        Path(bf.name).stem, b_attribs)
+                    new_version = core.next_version(old_version)
+                    out_stem = core.build_output_stem(part_no, new_version, today_mmdd)
+                    for n in name_notes:
+                        log_entries.append(("write", f"- 檔名：{n}"))
 
-                    stem = Path(bf.name).stem
+                    log_entries.append(("write", f"- 比例欄位：**{report.scale.ratio_text}**"))
+                    if report.unmatched_attdefs:
+                        log_entries.append(("write", f"- 找不到對應舊值、沿用 A 預設的欄位：{report.unmatched_attdefs}"))
+                    if report.relocated_entities:
+                        log_entries.append(("write", f"- 有 {report.relocated_entities} 個物件因為壓到標題欄，已移到圖框下方，請手動拖回。"))
+                    for w in report.warnings:
+                        log_entries.append(("write", f"- ⚠️ {w}"))
+
                     if "DXF (AutoCAD 2000)" in output_formats:
-                        outputs.append((f"{stem}_merged.dxf", write_dxf_bytes(out_doc), "application/dxf"))
+                        outputs.append((f"{out_stem}.dxf", write_dxf_bytes(out_doc), "application/dxf"))
                     if "PNG 預覽圖" in output_formats:
                         png = render_preview_png(out_doc, target_layout)
-                        outputs.append((f"{stem}_merged_preview.png", png, "image/png"))
-                        st.image(png, caption=f"{stem} 合併結果預覽", use_container_width=True)
+                        outputs.append((f"{out_stem}.png", png, "image/png"))
+                        images.append((out_stem, png, f"{out_stem} 合併結果預覽"))
                 except Exception as e:
-                    st.error(f"{bf.name} 合併失敗：{e}")
+                    log_entries.append(("error", f"{bf.name} 合併失敗：{e}"))
 
-            if len(outputs) == 1:
-                fname, data, mime = outputs[0]
-                st.download_button(f"下載 {fname}", data=data, file_name=fname, mime=mime)
-            elif len(outputs) > 1:
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for fname, data, _mime in outputs:
-                        zf.writestr(fname, data)
-                zip_buffer.seek(0)
-                st.download_button(
-                    "下載全部結果 (ZIP)", data=zip_buffer, file_name="merged_drawings.zip",
-                    mime="application/zip",
-                )
+            st.session_state["merge_log_entries"] = log_entries
+            st.session_state["merge_outputs"] = outputs
+            st.session_state["merge_images"] = images
+
+        for kind, text in st.session_state.get("merge_log_entries", []):
+            (st.error if kind == "error" else st.write)(text)
+        for stem, png, caption in st.session_state.get("merge_images", []):
+            st.image(png, caption=caption, use_container_width=True)
+        for i, (fname, data, mime) in enumerate(st.session_state.get("merge_outputs", [])):
+            clicked = st.download_button(
+                f"下載 {fname}", data=data, file_name=fname, mime=mime, key=f"dl_{i}")
+            if clicked:
+                log_download(fname)
 
 # =======================================================================
-# TAB 3 — About / limitations
+# TAB 3 — Usage statistics
+# =======================================================================
+with tab_stats:
+    st.subheader("使用統計")
+    if github_store.is_usage_log_configured():
+        try:
+            log_bytes = github_store.download_usage_log()
+        except Exception as e:
+            st.error(f"讀取使用紀錄失敗：{e}")
+            log_bytes = None
+        stats = core.compute_usage_stats(log_bytes)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("本月下載次數", stats["this_month"])
+        c2.metric("今年下載次數", stats["this_year"])
+        c3.metric("累計總下載次數", stats["total"])
+        if stats["by_month"]:
+            st.write("每月下載次數：")
+            st.bar_chart(stats["by_month"])
+        if log_bytes:
+            st.download_button(
+                "下載完整使用紀錄 (CSV)", data=log_bytes,
+                file_name="dwgmerge_usage_log.csv", mime="text/csv",
+            )
+        else:
+            st.caption("目前還沒有任何下載紀錄。")
+    else:
+        st.warning(
+            "尚未設定 GitHub 同步（見 README「部署」章節的 `usage_log_path` 設定），"
+            "使用次數無法跨使用者/跨重新部署累計，以下只是「這次瀏覽器分頁」暫時的計數，"
+            "重新整理頁面或別人打開這個工具都不會算在一起。"
+        )
+        st.metric("這次瀏覽器分頁的下載次數", st.session_state.get("session_download_count", 0))
+
+# =======================================================================
+# TAB 4 — About / limitations
 # =======================================================================
 with tab_about:
     st.markdown(Path(__file__).with_name("ABOUT.md").read_text(encoding="utf-8"))
