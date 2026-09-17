@@ -41,7 +41,21 @@ dwgmerge_engine/
 templates/
   Wellell-standard-V7-2004.dxf   內建的預設基準圖框（第一次啟動就有東西可用）
 test_engine.py           開發用的驗證腳本（不是 app 的一部分，可以刪除或保留）
+packages.txt             Streamlit Community Cloud 專用：部署時要額外裝的系統套件（見下方字型說明）
 ```
+
+## 「基準圖框」分頁的圖紙預覽失敗：`no fonts available, not even fallback fonts`
+
+**原因**：預覽圖是靠 `ezdxf` 的繪圖套件（底層用 matplotlib）把圖紙畫成 PNG，畫文字的時候需要真正的字型檔（.ttf/.otf）。`ezdxf` 會去掃系統的字型資料夾（Linux 上是 `/usr/share/fonts` 等路徑）建立一份字型清單；**Streamlit Community Cloud 的部署環境是一個很精簡的容器，預設完全沒有安裝任何系統字型**，所以這份清單是空的，畫到中文標題欄文字時就找不到任何字型可用，跳出這個錯誤——這是部署環境缺字型檔的問題，不是程式邏輯錯誤，本機測試環境通常有系統字型所以不會出現。
+
+**對策**：新增 `packages.txt`（Streamlit Community Cloud 會在部署時自動讀取這個檔案、用 `apt-get` 額外安裝裡面列出的系統套件），內容是：
+
+```
+fonts-dejavu-core
+fonts-noto-cjk
+```
+
+`fonts-noto-cjk` 提供中文字型（標題欄、Notes 都是中文），`fonts-dejavu-core` 提供英數字型。**這個檔案要跟 `app.py` 放在同一層（repo 根目錄），上傳後在 Streamlit 後台按「Reboot app」讓它重新建置容器**（單純的程式碼更新不會重新跑 apt 安裝，一定要整個重建才會裝上字型）。
 
 ## 開發中/待實作的更新項目（依使用者要求列出，時機由開發者判斷）
 

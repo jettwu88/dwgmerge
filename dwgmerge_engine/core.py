@@ -260,3 +260,101 @@ def set_lineweight_for_undefined_layers(doc, lineweight_1_100mm: int, skip_names
             layer.dxf.lineweight = lineweight_1_100mm
             changed.append(layer.dxf.name)
     return changed
+
+
+# ---------------------------------------------------------------------
+# Auto-detection helpers (roadmap items #1 and #2: auto paper-size
+# selection, auto semi-finished detection) - both are advisory, always
+# meant to be overridable by hand in the UI, never a silent decision.
+# ---------------------------------------------------------------------
+
+AUTO_SHEET_MARGIN_MM = 20.0  # matches the printable-area margin used
+                             # elsewhere for clean-scale fitting
+
+
+def _layout_area(layout) -> float:
+    return layout.dxf.paper_width * layout.dxf.paper_height
+
+
+def suggest_target_layout(a_doc, b_doc) -> tuple[str, str]:
+    """Auto-pick which of A's layouts best fits B's model, based on raw
+    (unscaled) model size vs. each layout's printable area - NOT on the
+    scale that would eventually be used (compute_clean_scale can always
+    shrink a model to fit, that's a separate step; this is purely about
+    "is this basically a small part or a big one").
+
+    Rule (as specified by the user): if B's model fits inside the
+    smallest available sheet (e.g. A4) without needing much reduction,
+    use that one - and prefer its portrait/vertical variant (a layout
+    name ending in "-V") when the model itself is taller than it is
+    wide; otherwise fall back to the largest available sheet (e.g. A3).
+    Only two tiers are considered because that's what the current
+    template family provides (A4 / A4-V / A3) - if a future template
+    adds more sizes, this still degrades sanely: smallest-that-fits,
+    else largest overall.
+
+    Returns (layout_name, note) - `note` is a short, user-facing
+    Traditional Chinese explanation of why this layout was picked (or
+    why the auto-pick gave up and fell back), meant to be shown next to
+    the auto-selected value so the user can sanity-check or override
+    it by hand.
+    """
+    names = list_layout_names(a_doc)
+    if not names:
+        raise ValueError("A 模板沒有任何圖紙 Layout，無法自動選擇圖紙尺寸。")
+
+    by_area = sorted(names, key=lambda n: _layout_area(a_doc.layout(n)))
+    smallest_name = by_area[0]
+    largest_name = by_area[-1]
+
+    box = model_bbox(b_doc)
+    if not box.has_data:
+        return largest_name, (
+            f"無法量測 B 圖模型範圍的大小，已自動選擇最大的圖紙尺寸「{largest_name}」，請自行確認。"
+        )
+    mw, mh = box.size.x, box.size.y
+
+    def fits(name: str) -> bool:
+        lay = a_doc.layout(name)
+        pw = lay.dxf.paper_width - AUTO_SHEET_MARGIN_MM
+        ph = lay.dxf.paper_height - AUTO_SHEET_MARGIN_MM
+        return mw <= pw and mh <= ph
+
+    def vertical_variant_of(name: str) -> Optional[str]:
+        base = name.upper().replace(" ", "").replace("-V", "")
+        for n in names:
+            if n.upper().replace(" ", "") in (f"{base}-V", f"{base}V"):
+                return n
+        return None
+
+    if fits(smallest_name):
+        portrait = mh > mw
+        v_name = vertical_variant_of(smallest_name)
+        if portrait and v_name:
+            return v_name, (
+                f"模型尺寸約 {mw:.0f}x{mh:.0f}mm，偏直式，且在「{smallest_name}」的可用範圍內，"
+                f"自動選擇直式圖紙「{v_name}」。"
+            )
+        return smallest_name, (
+            f"模型尺寸約 {mw:.0f}x{mh:.0f}mm，在最小圖紙「{smallest_name}」的可用範圍內，"
+            f"自動選擇「{smallest_name}」。"
+        )
+
+    if largest_name != smallest_name:
+        return largest_name, (
+            f"模型尺寸約 {mw:.0f}x{mh:.0f}mm，超出最小圖紙「{smallest_name}」的可用範圍，"
+            f"自動選擇最大的圖紙「{largest_name}」（仍會依比例縮小到能放入圖框）。"
+        )
+    return largest_name, f"模型尺寸約 {mw:.0f}x{mh:.0f}mm，自動選擇「{largest_name}」。"
+
+
+def b_has_bom_objects(b_doc) -> bool:
+    """Whether B's own paperspace layout contains an embedded OLE object
+    (OLE2FRAME - e.g. a pasted Excel BOM table), used to auto-detect
+    "this is a semi-finished/assembly drawing" without requiring the
+    user to check a box by hand."""
+    names = list_layout_names(b_doc)
+    if not names:
+        return False
+    b_layout = b_doc.layout(names[0])
+    return any(e.dxftype() == "OLE2FRAME" for e in b_layout)
