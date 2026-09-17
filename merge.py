@@ -41,7 +41,7 @@ from ezdxf.addons import importer
 from ezdxf.math import Vec3
 from ezdxf import bbox as ezbbox
 
-from . import core
+import core
 
 MODE_B_CONTENT_A_STYLE = "1"
 MODE_B_STYLE_A_FRAME_ONLY = "2"
