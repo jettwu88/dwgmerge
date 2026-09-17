@@ -17,13 +17,13 @@ from ezdxf.addons.drawing import RenderContext, Frontend
 from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
 import matplotlib.pyplot as plt
 
-import core
-import merge
+from dwgmerge_engine import core, merge
 import github_store
 
 st.set_page_config(page_title="Wellell 圖框合併工具", layout="wide")
 
-TEMPLATE_DIR = Path(__file__).parent
+TEMPLATE_DIR = Path(__file__).parent / "templates"
+TEMPLATE_DIR.mkdir(exist_ok=True)
 DEFAULT_TEMPLATE_NAME = "current_template.dxf"
 
 MODE_LABELS = {

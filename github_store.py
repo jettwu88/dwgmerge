@@ -33,7 +33,7 @@ API_ROOT = "https://api.github.com"
 def _cfg():
     try:
         gh = st.secrets["github"]
-        return gh["token"], gh["repo"], gh.get("path", "current_template.dxf"), gh.get("branch", "main")
+        return gh["token"], gh["repo"], gh.get("path", "templates/current_template.dxf"), gh.get("branch", "main")
     except Exception:
         return None, None, None, None
 
